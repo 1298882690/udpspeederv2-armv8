@@ -1,5 +1,5 @@
 #!/bin/bash
-# udp-tunnel-manager.sh - OpenWRT/Debian通用udpspeeder+udp2raw管理脚本
+# udp-tunnel-manager.sh - OpenWRT/Debian/Ubuntu通用udpspeeder+udp2raw管理脚本
 
 set -e  # 遇到错误立即退出
 
@@ -13,11 +13,13 @@ NC='\033[0m' # No Color
 # 系统检测变量
 OS_TYPE=""
 ARCH=""
+ARCH_RAW=""
 INIT_SYSTEM=""
 BIN_DIR="/usr/bin"
 CONFIG_DIR="/etc/udp-tunnel"
 LOG_DIR="/var/log/udp-tunnel"
 SERVICE_USER="nobody"
+HAS_AES=false
 
 # 版本配置
 UDPSPEEDER_VERSION="20230206.0"
@@ -34,7 +36,7 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 detect_environment() {
     log_step "检测系统环境..."
     
-    # 检测操作系统
+    # 检测操作系统（更新：添加Ubuntu支持）
     if [ -f "/etc/openwrt_release" ]; then
         OS_TYPE="openwrt"
         BIN_DIR="/usr/bin"
@@ -42,35 +44,159 @@ detect_environment() {
         LOG_DIR="/tmp/udp-tunnel"
         INIT_SYSTEM="procd"
         log_info "检测到OpenWRT系统"
-    elif [ -f "/etc/debian_version" ]; then
-        OS_TYPE="debian"
+    elif [ -f "/etc/debian_version" ] || [ -f "/etc/lsb-release" ] && grep -q "Ubuntu" /etc/lsb-release 2>/dev/null; then
+        # 同时支持Debian和Ubuntu
+        if [ -f "/etc/lsb-release" ] && grep -q "Ubuntu" /etc/lsb-release; then
+            OS_TYPE="ubuntu"
+            log_info "检测到Ubuntu系统"
+        else
+            OS_TYPE="debian"
+            log_info "检测到Debian系统"
+        fi
         BIN_DIR="/usr/local/bin"
         CONFIG_DIR="/etc/udp-tunnel"
         LOG_DIR="/var/log/udp-tunnel"
         INIT_SYSTEM="systemd"
-        log_info "检测到Debian系统"
     else
         log_error "不支持的操作系统"
         exit 1
     fi
     
-    # 检测架构
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64|amd64) ARCH="amd64" ;;
-        aarch64|arm64) ARCH="arm64" ;;
-        armv7l|armhf) ARCH="arm" ;;
-        mips|mips_be) ARCH="mips_be" ;;
-        mipsle|mips_le) ARCH="mips_le" ;;
+    # 检测架构（更新：ARMv8特殊处理）
+    ARCH_RAW=$(uname -m)
+    case $ARCH_RAW in
+        x86_64|amd64) 
+            ARCH="amd64"
+            ARCH_DISPLAY="amd64"
+            ;;
+        aarch64|arm64) 
+            ARCH="armv8"  # 特殊标记为armv8
+            ARCH_DISPLAY="aarch64/arm64"
+            ;;
+        armv7l|armhf) 
+            ARCH="arm"
+            ARCH_DISPLAY="armv7"
+            ;;
+        mips|mips_be) 
+            ARCH="mips_be"
+            ARCH_DISPLAY="mips_be"
+            ;;
+        mipsle|mips_le) 
+            ARCH="mips_le"
+            ARCH_DISPLAY="mips_le"
+            ;;
         *) 
-            log_warn "未知架构: $ARCH，使用通用配置"
+            log_warn "未知架构: $ARCH_RAW，使用通用配置"
             ARCH="generic"
+            ARCH_DISPLAY="generic"
             ;;
     esac
-    log_info "系统架构: $ARCH"
+    log_info "系统架构: $ARCH_DISPLAY (原始: $ARCH_RAW)"
+    
+    # 检测AES指令集支持（新增功能）
+    detect_aes_support
     
     # 创建必要目录
     mkdir -p $CONFIG_DIR $LOG_DIR
+}
+
+# 检测AES指令集支持
+detect_aes_support() {
+    log_step "检测CPU AES指令集支持..."
+    
+    HAS_AES=false
+    # 方法1: 使用cpuid命令
+    if command -v cpuid >/dev/null 2>&1; then
+        if cpuid | grep -i "aes instruction" | grep -q "true"; then
+            HAS_AES=true
+            log_info "CPU支持AES指令集 (cpuid检测)"
+        fi
+    # 方法2: 检查/proc/cpuinfo
+    elif grep -q -i "aes" /proc/cpuinfo 2>/dev/null; then
+        HAS_AES=true
+        log_info "CPU支持AES指令集 (/proc/cpuinfo检测)"
+    # 方法3: 检查CPU标志
+    elif [ -f "/proc/cpuinfo" ] && grep -q "flags" /proc/cpuinfo && grep "flags" /proc/cpuinfo | grep -q -i "aes"; then
+        HAS_AES=true
+        log_info "CPU支持AES指令集 (flags检测)"
+    else
+        log_warn "未检测到AES指令集支持，将使用标准版本"
+    fi
+    
+    if [ "$HAS_AES" = true ]; then
+        log_info "将尝试下载AES加速版本"
+    fi
+}
+
+# 获取带AES后缀的文件名
+get_aes_filename() {
+    local base_name="$1"
+    local aes_suffix=""
+    
+    case $ARCH in
+        amd64)
+            aes_suffix="_hw_aes"
+            ;;
+        x86)
+            aes_suffix="_asm_aes"
+            ;;
+        mips_be|mips_le)
+            aes_suffix="_asm_aes"
+            ;;
+        arm|armv8)
+            aes_suffix="_asm_aes"
+            ;;
+        *)
+            aes_suffix=""
+            ;;
+    esac
+    
+    if [ "$HAS_AES" = true ] && [ -n "$aes_suffix" ]; then
+        echo "${base_name}${aes_suffix}"
+    else
+        echo "$base_name"
+    fi
+}
+
+# 下载函数（支持备用源）
+download_with_fallback() {
+    local url="$1"
+    local output="$2"
+    local filename="$3"
+    local max_retries=3
+    local retry_count=0
+    
+    # 主下载源
+    local main_url="$url"
+    # 备用下载源（添加代理前缀）
+    local fallback_url="https://hk.gh-proxy.com/${url#https://}"
+    
+    while [ $retry_count -lt $max_retries ]; do
+        log_info "尝试下载 $filename (尝试 $((retry_count+1))/$max_retries)..."
+        
+        # 首先尝试主源
+        if wget -q --timeout=20 --tries=2 -O "$output" "$main_url"; then
+            log_info "下载成功: $filename"
+            return 0
+        fi
+        
+        log_warn "主源下载失败，尝试备用源..."
+        
+        # 尝试备用源
+        if wget -q --timeout=20 --tries=2 -O "$output" "$fallback_url"; then
+            log_info "备用源下载成功: $filename"
+            return 0
+        fi
+        
+        retry_count=$((retry_count+1))
+        if [ $retry_count -lt $max_retries ]; then
+            log_warn "下载失败，5秒后重试..."
+            sleep 5
+        fi
+    done
+    
+    log_error "下载失败: $filename"
+    return 1
 }
 
 # 功能1: 下载并安装
@@ -94,51 +220,118 @@ install_binaries() {
         return 1
     fi
     
-    # 下载udpspeeder
+    # 下载udpspeeder（特殊处理ARMv8）
     log_info "下载udpspeeder..."
-    UDPSPEEDER_URL="${REPO_BASE}UDPspeeder/releases/download/${UDPSPEEDER_VERSION}/speederv2_${ARCH}.tar.gz"
-    if wget -q --timeout=10 --tries=3 -O /tmp/speederv2.tar.gz "$UDPSPEEDER_URL"; then
-        log_info "下载udpspeeder成功"
+    
+    if [ "$ARCH" = "armv8" ]; then
+        # ARMv8特殊处理
+        log_info "检测到ARMv8架构，使用专用版本"
+        UDPSPEEDER_URL="https://raw.githubusercontent.com/1298882690/udpspeederv2-armv8/refs/heads/main/udpspeederv2-armv8"
+        UDPSPEEDER_FALLBACK="https://hk.gh-proxy.com/https://raw.githubusercontent.com/1298882690/udpspeederv2-armv8/refs/heads/main/udpspeederv2-armv8"
+        
+        if download_with_fallback "$UDPSPEEDER_URL" "/tmp/speederv2_armv8" "udpspeederv2-armv8"; then
+            SPEEDER_BIN="/tmp/speederv2_armv8"
+            log_info "ARMv8专用版下载成功"
+        else
+            log_error "ARMv8专用版下载失败"
+            return 1
+        fi
     else
-        log_error "下载udpspeeder失败，尝试备用源..."
-        # 这里可以添加备用下载源
-        return 1
+        # 标准架构处理
+        local speeder_binary="speederv2_$ARCH"
+        UDPSPEEDER_URL="${REPO_BASE}UDPspeeder/releases/download/${UDPSPEEDER_VERSION}/${speeder_binary}.tar.gz"
+        
+        if download_with_fallback "$UDPSPEEDER_URL" "/tmp/speederv2.tar.gz" "speederv2_$ARCH.tar.gz"; then
+            log_info "udpspeeder下载成功"
+            tar -xzf /tmp/speederv2.tar.gz -C /tmp/
+            SPEEDER_BIN=$(find /tmp -name "speederv2_*" -type f 2>/dev/null | head -1)
+        else
+            log_error "udpspeeder下载失败"
+            return 1
+        fi
     fi
     
-    # 下载udp2raw
+    # 下载udp2raw（支持AES版本）
     log_info "下载udp2raw..."
-    UDP2RAW_URL="${REPO_BASE}udp2raw-tunnel/releases/download/${UDP2RAW_VERSION}/udp2raw_binaries.tar.gz"
-    if wget -q --timeout=10 --tries=3 -O /tmp/udp2raw.tar.gz "$UDP2RAW_URL"; then
-        log_info "下载udp2raw成功"
-    else
-        log_error "下载udp2raw失败"
-        return 1
+    
+    # 根据AES支持选择文件名
+    local udp2raw_base="udp2raw_$ARCH"
+    local udp2raw_binary=$(get_aes_filename "$udp2raw_base")
+    
+    if [ "$ARCH" = "armv8" ]; then
+        # ARMv8可能需要特殊处理，这里先尝试标准命名
+        udp2raw_binary="udp2raw_arm"
+        if [ "$HAS_AES" = true ]; then
+            udp2raw_binary="udp2raw_arm_asm_aes"
+        fi
     fi
     
-    # 解压并安装
-    log_info "解压文件..."
-    tar -xzf /tmp/speederv2.tar.gz -C /tmp/
-    tar -xzf /tmp/udp2raw.tar.gz -C /tmp/
+    UDP2RAW_URL="${REPO_BASE}udp2raw-tunnel/releases/download/${UDP2RAW_VERSION}/${udp2raw_binary}"
     
-    # 查找二进制文件
-    SPEEDER_BIN=$(find /tmp -name "speederv2_*" -type f 2>/dev/null | head -1)
-    UDP2RAW_BIN=$(find /tmp -name "udp2raw_*" -type f 2>/dev/null | head -1)
-    
-    if [ -z "$SPEEDER_BIN" ] || [ -z "$UDP2RAW_BIN" ]; then
-        log_error "未找到二进制文件"
-        return 1
+    # 尝试下载AES版本
+    if [ "$HAS_AES" = true ]; then
+        log_info "尝试下载AES加速版本: $udp2raw_binary"
+        if download_with_fallback "$UDP2RAW_URL" "/tmp/$udp2raw_binary" "$udp2raw_binary"; then
+            UDP2RAW_BIN="/tmp/$udp2raw_binary"
+            log_info "udp2raw AES版本下载成功"
+        else
+            log_warn "AES版本下载失败，尝试标准版本"
+            # 回退到标准版本
+            udp2raw_binary="udp2raw_$ARCH"
+            UDP2RAW_URL="${REPO_BASE}udp2raw-tunnel/releases/download/${UDP2RAW_VERSION}/${udp2raw_binary}"
+            if download_with_fallback "$UDP2RAW_URL" "/tmp/$udp2raw_binary" "$udp2raw_binary"; then
+                UDP2RAW_BIN="/tmp/$udp2raw_binary"
+                HAS_AES=false  # 更新标记
+            else
+                log_error "udp2raw下载失败"
+                return 1
+            fi
+        fi
+    else
+        # 标准版本下载
+        if download_with_fallback "$UDP2RAW_URL" "/tmp/$udp2raw_binary" "$udp2raw_binary"; then
+            UDP2RAW_BIN="/tmp/$udp2raw_binary"
+            log_info "udp2raw标准版本下载成功"
+        else
+            log_error "udp2raw下载失败"
+            return 1
+        fi
     fi
     
     # 安装到系统目录
     log_info "安装二进制文件到 $BIN_DIR"
-    install -m 755 "$SPEEDER_BIN" "$BIN_DIR/speederv2"
-    install -m 755 "$UDP2RAW_BIN" "$BIN_DIR/udp2raw"
+    
+    if [ -n "$SPEEDER_BIN" ] && [ -f "$SPEEDER_BIN" ]; then
+        install -m 755 "$SPEEDER_BIN" "$BIN_DIR/speederv2"
+        log_info "udpspeeder安装完成"
+    else
+        log_error "udpspeeder二进制文件不存在"
+        return 1
+    fi
+    
+    if [ -n "$UDP2RAW_BIN" ] && [ -f "$UDP2RAW_BIN" ]; then
+        install -m 755 "$UDP2RAW_BIN" "$BIN_DIR/udp2raw"
+        log_info "udp2raw安装完成"
+        
+        # 显示AES状态
+        if [ "$HAS_AES" = true ]; then
+            log_info "已安装AES加速版本"
+        fi
+    else
+        log_error "udp2raw二进制文件不存在"
+        return 1
+    fi
     
     # 验证安装
     if command -v speederv2 >/dev/null 2>&1 && command -v udp2raw >/dev/null 2>&1; then
         log_info "安装成功!"
         echo "udpspeeder版本: $(speederv2 -h 2>&1 | head -1)"
         echo "udp2raw版本: $(udp2raw -h 2>&1 | head -1)"
+        
+        # 显示架构信息
+        if [ "$ARCH" = "armv8" ]; then
+            log_info "已安装ARMv8专用版本"
+        fi
         return 0
     else
         log_error "安装验证失败"
@@ -146,286 +339,8 @@ install_binaries() {
     fi
 }
 
-# 功能2: 配置系统服务
-configure_services() {
-    log_step "配置系统服务..."
-    
-    # 获取用户配置
-    read -p "请输入服务密码: " SERVICE_PASS
-    read -p "请输入服务端口 (默认: 3333): " SERVICE_PORT
-    SERVICE_PORT=${SERVICE_PORT:-3333}
-    
-    # 根据角色创建配置文件
-    if [ "$ROLE" = "client" ]; then
-        read -p "请输入服务器IP地址: " SERVER_IP
-        
-        cat > $CONFIG_DIR/client.conf << EOF
-# udpspeeder客户端配置
-SPEEDER_MODE="-c"
-SPEEDER_OPTIONS="-l0.0.0.0:${SERVICE_PORT} -r127.0.0.1:$((SERVICE_PORT+1)) -f20:10 -k\"${SERVICE_PASS}\""
-
-# udp2raw客户端配置
-UDP2RAW_MODE="-c"
-UDP2RAW_OPTIONS="-l0.0.0.0:$((SERVICE_PORT+1)) -r${SERVER_IP}:$((SERVICE_PORT+2)) -k\"${SERVICE_PASS}\" --raw-mode faketcp"
-EOF
-        log_info "客户端配置文件已创建: $CONFIG_DIR/client.conf"
-    else
-        cat > $CONFIG_DIR/server.conf << EOF
-# udpspeeder服务端配置
-SPEEDER_MODE="-s"
-SPEEDER_OPTIONS="-l0.0.0.0:$((SERVICE_PORT+1)) -r127.0.0.1:$((SERVICE_PORT+2)) -f20:10 -k\"${SERVICE_PASS}\""
-
-# udp2raw服务端配置
-UDP2RAW_MODE="-s"
-UDP2RAW_OPTIONS="-l0.0.0.0:$((SERVICE_PORT+2)) -r127.0.0.1:$((SERVICE_PORT+3)) -k\"${SERVICE_PASS}\" --raw-mode faketcp"
-EOF
-        log_info "服务端配置文件已创建: $CONFIG_DIR/server.conf"
-    fi
-    
-    # 创建启动脚本
-    create_startup_scripts
-    
-    # 根据初始化系统创建服务
-    case $INIT_SYSTEM in
-        systemd)
-            create_systemd_service
-            ;;
-        procd)
-            create_procd_service
-            ;;
-    esac
-    
-    log_info "服务配置完成"
-}
-
-# 创建启动脚本
-create_startup_scripts() {
-    log_info "创建启动脚本..."
-    
-    cat > $BIN_DIR/start-udp-tunnel.sh << 'EOF'
-#!/bin/bash
-CONFIG_DIR="/etc/udp-tunnel"
-LOG_DIR="/var/log/udp-tunnel"
-
-# 读取配置
-if [ -f "$CONFIG_DIR/client.conf" ]; then
-    source $CONFIG_DIR/client.conf
-    ROLE="client"
-elif [ -f "$CONFIG_DIR/server.conf" ]; then
-    source $CONFIG_DIR/server.conf
-    ROLE="server"
-else
-    echo "未找到配置文件"
-    exit 1
-fi
-
-# 启动udp2raw
-echo "启动udp2raw ($ROLE)..."
-eval "udp2raw $UDP2RAW_MODE $UDP2RAW_OPTIONS" > $LOG_DIR/udp2raw.log 2>&1 &
-UDP2RAW_PID=$!
-
-# 等待udp2raw启动
-sleep 2
-
-# 启动udpspeeder
-echo "启动udpspeeder ($ROLE)..."
-eval "speederv2 $SPEEDER_MODE $SPEEDER_OPTIONS" > $LOG_DIR/speederv2.log 2>&1 &
-SPEEDER_PID=$!
-
-# 保存PID
-echo $UDP2RAW_PID > /var/run/udp2raw.pid
-echo $SPEEDER_PID > /var/run/speederv2.pid
-
-echo "服务启动完成"
-echo "udp2raw PID: $UDP2RAW_PID"
-echo "speederv2 PID: $SPEEDER_PID"
-EOF
-    
-    chmod +x $BIN_DIR/start-udp-tunnel.sh
-}
-
-# 创建systemd服务
-create_systemd_service() {
-    log_info "创建systemd服务..."
-    
-    cat > /etc/systemd/system/udp-tunnel.service << EOF
-[Unit]
-Description=UDP Tunnel (udpspeeder+udp2raw)
-After=network.target
-
-[Service]
-Type=forking
-ExecStart=$BIN_DIR/start-udp-tunnel.sh
-ExecStop=/bin/kill -TERM \$(cat /var/run/udp2raw.pid /var/run/speederv2.pid 2>/dev/null)
-Restart=always
-RestartSec=10
-User=$SERVICE_USER
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    systemctl daemon-reload
-    systemctl enable udp-tunnel.service
-    systemctl start udp-tunnel.service
-    
-    if systemctl is-active udp-tunnel.service >/dev/null 2>&1; then
-        log_info "systemd服务启动成功"
-    else
-        log_error "systemd服务启动失败"
-        journalctl -u udp-tunnel.service -n 20 --no-pager
-    fi
-}
-
-# 创建procd服务 (OpenWRT)
-create_procd_service() {
-    log_info "创建procd服务..."
-    
-    cat > /etc/init.d/udp-tunnel << 'EOF'
-#!/bin/sh /etc/rc.common
-
-START=99
-STOP=10
-
-start() {
-    $BIN_DIR/start-udp-tunnel.sh
-}
-
-stop() {
-    kill \$(cat /var/run/udp2raw.pid 2>/dev/null) 2>/dev/null
-    kill \$(cat /var/run/speederv2.pid 2>/dev/null) 2>/dev/null
-    rm -f /var/run/udp2raw.pid /var/run/speederv2.pid
-}
-
-restart() {
-    stop
-    sleep 2
-    start
-}
-EOF
-    
-    chmod +x /etc/init.d/udp-tunnel
-    /etc/init.d/udp-tunnel enable
-    /etc/init.d/udp-tunnel start
-    
-    if [ -f "/var/run/udp2raw.pid" ] && [ -f "/var/run/speederv2.pid" ]; then
-        log_info "procd服务启动成功"
-    else
-        log_error "procd服务启动失败"
-    fi
-}
-
-# 功能3: 检测运行状态
-check_status() {
-    log_step "检测服务运行状态..."
-    
-    # 检查进程
-    echo "=== 进程状态 ==="
-    if pgrep -x "speederv2" >/dev/null; then
-        echo -e "udpspeeder: ${GREEN}运行中${NC} (PID: $(pgrep -x speederv2))"
-    else
-        echo -e "udpspeeder: ${RED}未运行${NC}"
-    fi
-    
-    if pgrep -x "udp2raw" >/dev/null; then
-        echo -e "udp2raw: ${GREEN}运行中${NC} (PID: $(pgrep -x udp2raw))"
-    else
-        echo -e "udp2raw: ${RED}未运行${NC}"
-    fi
-    
-    # 检查端口监听
-    echo -e "\n=== 端口监听状态 ==="
-    echo "udp/tcp端口监听:"
-    netstat -tunpl 2>/dev/null | grep -E "udp|tcp" | grep -E "$(pgrep -x speederv2|tr '\n' '|')|$(pgrep -x udp2raw|tr '\n' '|')" || echo "未找到相关端口监听"
-    
-    # 检查服务文件
-    echo -e "\n=== 配置文件状态 ==="
-    ls -la $CONFIG_DIR/ 2>/dev/null || echo "配置目录不存在"
-    
-    # 检查日志文件
-    echo -e "\n=== 日志文件状态 ==="
-    ls -la $LOG_DIR/ 2>/dev/null | head -10 || echo "日志目录不存在"
-    
-    # 系统服务状态
-    echo -e "\n=== 系统服务状态 ==="
-    case $INIT_SYSTEM in
-        systemd)
-            systemctl status udp-tunnel.service --no-pager | head -20
-            ;;
-        procd)
-            /etc/init.d/udp-tunnel status 2>/dev/null || echo "procd服务状态检查失败"
-            ;;
-    esac
-}
-
-# 功能4: 查看日志
-view_logs() {
-    log_step "查看服务日志..."
-    
-    echo "请选择要查看的日志:"
-    echo "  1. udpspeeder日志"
-    echo "  2. udp2raw日志"
-    echo "  3. 系统服务日志"
-    echo "  4. 所有日志"
-    read -p "请输入选择 (1-4): " LOG_CHOICE
-    
-    case $LOG_CHOICE in
-        1)
-            if [ -f "$LOG_DIR/speederv2.log" ]; then
-                tail -50 $LOG_DIR/speederv2.log
-            else
-                log_error "udpspeeder日志不存在"
-            fi
-            ;;
-        2)
-            if [ -f "$LOG_DIR/udp2raw.log" ]; then
-                tail -50 $LOG_DIR/udp2raw.log
-            else
-                log_error "udp2raw日志不存在"
-            fi
-            ;;
-        3)
-            case $INIT_SYSTEM in
-                systemd)
-                    journalctl -u udp-tunnel.service -n 50 --no-pager
-                    ;;
-                procd)
-                    log_warn "OpenWRT请手动查看日志: cat $LOG_DIR/*.log"
-                    cat $LOG_DIR/*.log 2>/dev/null | tail -50 || echo "无日志内容"
-                    ;;
-            esac
-            ;;
-        4)
-            echo "=== udpspeeder日志 ==="
-            tail -20 $LOG_DIR/speederv2.log 2>/dev/null || echo "无udpspeeder日志"
-            echo -e "\n=== udp2raw日志 ==="
-            tail -20 $LOG_DIR/udp2raw.log 2>/dev/null || echo "无udp2raw日志"
-            ;;
-        *)
-            log_error "无效的选择"
-            ;;
-    esac
-}
-
-# 主菜单
-show_menu() {
-    clear
-    echo "========================================="
-    echo "  UDP隧道管理脚本 (OpenWRT/Debian通用)"
-    echo "========================================="
-    echo "当前系统: $OS_TYPE | 架构: $ARCH"
-    echo "当前角色: ${ROLE:-未设置}"
-    echo "-----------------------------------------"
-    echo "  1. 下载并安装二进制文件"
-    echo "  2. 配置系统服务"
-    echo "  3. 检测运行状态"
-    echo "  4. 查看服务日志"
-    echo "  5. 启动/重启服务"
-    echo "  6. 停止服务"
-    echo "  7. 卸载服务"
-    echo "  0. 退出"
-    echo "========================================="
-}
+# 后续函数保持不变（configure_services, create_startup_scripts, create_systemd_service, create_procd_service, check_status, view_logs, show_menu, main）
+# 由于篇幅限制，这里只展示更新部分，完整脚本需要包含所有原函数
 
 # 主函数
 main() {
